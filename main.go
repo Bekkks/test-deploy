@@ -1,87 +1,94 @@
 package main
 
 import (
-	"fmt"
-	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
-	"strings"
+	"os"
+	"sync"
+
+	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		// В продакшене замените на конкретный домен
+		return os.Getenv("ENV") == "development" || true
+	},
 }
 
-var clients = make(map[*websocket.Conn]bool)
-var broadcast = make(chan string)
+var (
+	clients   = make(map[*websocket.Conn]bool)
+	clientsMu sync.Mutex // Мьютекс для потокобезопасности
+	broadcast = make(chan string)
+)
 
 func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080" // Fallback порт
+	}
+
+	// Статические файлы
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/ws", handleConnections)
+
 	go handleMessages()
-	fmt.Println("Listening on port 8080")
-	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
+
+	log.Printf("Сервер запущен на :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade error:", err)
-		return
-	}
-	defer ws.Close()
-
-	// Добавляем клиента
-	clients[ws] = true
-
-	// Просим имя
-	err = ws.WriteMessage(websocket.TextMessage, []byte("Привет! Введите ваше имя:"))
-	if err != nil {
-		log.Println("Write error:", err)
-		delete(clients, ws)
+		log.Println("Ошибка подключения:", err)
 		return
 	}
 
-	// Читаем имя
-	_, nameMsg, err := ws.ReadMessage()
-	if err != nil {
-		log.Println("Read name error:", err)
-		ws.WriteMessage(websocket.TextMessage, []byte("Ошибка при получении имени"))
-		delete(clients, ws)
-		return
-	}
-
-	name := strings.TrimSpace(strings.ToLower(string(nameMsg)))
-	if name != "beka" {
-		ws.WriteMessage(websocket.TextMessage, []byte("Неправильное имя пользователя"))
-		delete(clients, ws)
-		return
-	}
+	// Регистрация клиента
+	registerClient(ws)
+	defer unregisterClient(ws)
 
 	// Приветствие
-	ws.WriteMessage(websocket.TextMessage, []byte("Добро пожаловать в чат, Beka!"))
+	if err := ws.WriteMessage(websocket.TextMessage, []byte("Добро пожаловать в чат!")); err != nil {
+		log.Println("Ошибка приветствия:", err)
+		return
+	}
 
-	// Обработка сообщений
+	// Чтение сообщений
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
-			log.Println("Read message error:", err)
-			delete(clients, ws)
+			log.Println("Ошибка чтения:", err)
 			break
 		}
-		broadcast <- "Beka: " + string(msg)
+		broadcast <- string(msg)
 	}
 }
 
+func registerClient(ws *websocket.Conn) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	clients[ws] = true
+	log.Println("Новый клиент подключён")
+}
+
+func unregisterClient(ws *websocket.Conn) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	ws.Close()
+	delete(clients, ws)
+	log.Println("Клиент отключён")
+}
+
 func handleMessages() {
-	for {
-		msg := <-broadcast
+	for msg := range broadcast {
+		clientsMu.Lock()
 		for client := range clients {
-			err := client.WriteMessage(websocket.TextMessage, []byte(msg))
-			if err != nil {
-				client.Close()
-				delete(clients, client)
+			if err := client.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+				unregisterClient(client)
 			}
 		}
+		clientsMu.Unlock()
 	}
 }
